@@ -1,7 +1,6 @@
 import os
 from typing import List, Dict, Any
 from uuid import uuid4
-import base64
 
 import streamlit as st
 from openai import OpenAI
