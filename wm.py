@@ -2,39 +2,81 @@ import os
 from typing import List, Dict, Any
 from uuid import uuid4
 
+import requests
 import streamlit as st
 from openai import OpenAI
 
-# -------------------- Config --------------------
-st.set_page_config(page_title="UBS Orion | Wealth Management Assistant", page_icon="💬", layout="centered")
+# ==================== Config ====================
+st.set_page_config(page_title="Orion | Wealth Management Assistant", page_icon="💬", layout="centered")
 
-model = "gpt-4.1-nano"
-temperature = 0.7
-MAX_REPLY_CHARS = 1900
+MODEL = "gpt-4o"
+TEMPERATURE = 0.9
+MAX_REPLY_CHARS = 4000
 
-# Dark & Light Mode
-if "theme" not in st.session_state:
-    st.session_state.theme = "Light"
+# ==================== Helpers ====================
+@st.cache_resource(show_spinner=False)
+def _get_openai_client() -> OpenAI:
+    """Create a single OpenAI client for the app lifecycle."""
+    api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")  # type: ignore[attr-defined]
+    if not api_key:
+        st.error("Missing OPENAI_API_KEY. Add it to environment or st.secrets.")
+        st.stop()
+    return OpenAI(api_key=api_key)
 
-# Initialize session state
-if "chats" not in st.session_state:
-    st.session_state.chats = {}  # Dict: {chat_id: {"name": ..., "messages": [...] }}
-if "active_chat" not in st.session_state:
-    new_id = str(uuid4())
-    st.session_state.chats[new_id] = {"name": "Chat #1", "messages": []}
-    st.session_state.active_chat = new_id
 
-SYSTEM_PROMPT = (
-    "You are an AI Wealth Manager Assistant called Orion, you will assist the user of the chatbot who is a dedicated UBS Wealth Manager Executive"
-    "in his journey to ensure that the clients under his portfolio are well taken care of and with ample details to support them in their journey"
-    "include: (1) identifying and proactively recommending exclusive investment or lifestyle opportunities triggered by significant life milestones—"
+def _truncate(text: str, max_chars: int = MAX_REPLY_CHARS) -> str:
+    return text if len(text) <= max_chars else text[:max_chars]
+
+
+def _build_messages(system_prompt: str, history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Build messages for the API, stripping UI-only metadata keys."""
+    msgs: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    for m in history:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if not content:
+            continue
+        msgs.append({"role": role, "content": content})
+    return msgs
+
+
+def get_realtime_context(query: str, max_results: int = 3) -> str:
+    """Fetch short summaries of live data using DuckDuckGo's Instant Answer API.
+    This is optional context and will fail closed (returns a note) if the request fails.
+    """
+    try:
+        res = requests.get(
+            "https://api.duckduckgo.com/",
+            params={"q": query, "format": "json", "no_redirect": 1, "no_html": 1},
+            timeout=8,
+        )
+        data = res.json()
+        snippets = []
+
+        if data.get("AbstractText"):
+            snippets.append(data["AbstractText"])
+        for topic in data.get("RelatedTopics", [])[:max_results]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                snippets.append(topic["Text"])
+
+        if snippets:
+            return "\n".join(snippets)
+    except Exception as e:  # noqa: BLE001
+        return f"(Live data unavailable: {e})"
+
+    return "(No live results found.)"
+
+
+# ==================== Base System Prompt ====================
+BASE_SYSTEM_PROMPT = (
+    "You are an AI Wealth Manager Assistant called Orion. You assist a dedicated Wealth Manager Executive "
+    "in ensuring clients under their portfolio are well taken care of with ample details. "
+    "You (1) proactively recommend exclusive investment or lifestyle opportunities triggered by significant life milestones—"
     "such as tailored education planning for children entering elite institutions or orchestrating bespoke celebratory events like milestone anniversaries—"
-    "with Relationship Managers (RMs) empowered to coordinate logistics upon client approval; and (2) delivering high-touch concierge recommendations for upcoming travel, "
-    "taking into account personal health requirements, family composition (e.g., infant care or elder support), and cultural preferences, "
-    "all informed by RM-provided natural language input and the client’s comprehensive wealth and lifestyle profile."
-
-
-    "Before proceeding, confirm with me who will I be assisting or ask me if I would like a list of my current portfolio."
+    "with Relationship Managers (RMs) empowered to coordinate logistics upon client approval; and (2) deliver high-touch concierge recommendations for upcoming travel, "
+    "considering personal health requirements, family composition (e.g., infant care or elder support), and cultural preferences, "
+    "informed by RM-provided natural language input and the client’s comprehensive wealth and lifestyle profile. "
+    "Before proceeding, confirm who you will be assisting or offer to list the current portfolio. "
 
     # Alexandra Wu-Chan
     "Here is Alexandra Wu-Chan’s details: Alexandra Wu-Chan, age 38, is based in Hong Kong and has recently been appointed as CEO of her family’s multinational conglomerate—a major career milestone. "
@@ -51,7 +93,7 @@ SYSTEM_PROMPT = (
     "This occasion should trigger recommendations including luxury villa bookings, Grecian-style bespoke ceremony planning, and wellness-focused itineraries. "
     "In addition, real-time alerts should surface for exclusive watch auctions during his May 2026 visit to Geneva. "
 
-    # Charles Montgomery Iv
+    # Charles Montgomery IV
     "Here is Charles Montgomery IV’s details: Charles Montgomery IV, age 60, is based in London and is entering retirement in early 2026—a key transition point. "
     "He intends to establish a philanthropic foundation focused on climate resilience and education equity. "
     "He frequently travels to Monaco and the Maldives and has a deep appreciation for classical music, antiques, and private yacht excursions. "
@@ -73,26 +115,40 @@ SYSTEM_PROMPT = (
     "All bookings must be tailored for families with young children and provide Japanese-speaking guides. "
     "Investment briefings and venture capital summit alerts may also be surfaced during his sabbatical period. "
 
-
+    # Additional Notation
+    "Lastly, when asked for recommendations, be direct and straightforward and give exact locations or services."
 )
 
-# -------------------- Helpers --------------------
+# ==================== Seeded Opportunities Prompt ====================
+OPP_PROMPT = (
+    "Identify and summarize recent exclusive opportunities that may be of strong interest to any clients in your portfolio, based on their profiles, life milestones, and stated interests."
+    "Use the following criteria:"
+    "• For each client, find 1–2 high-relevance opportunities that match their current context (e.g. major life events, lifestyle preferences, travel plans, or investment themes)."
+    "• Focus on ultra-high-net-worth-appropriate experiences, investments, or partnerships (e.g. private placements, art or watch auctions, bespoke retreats, cultural events, or philanthropic forums)."
+    "• Prioritize relevance and recency — reference opportunities or events within the past 3 months."
+    "• Be concrete: specify names of events, locations, institutions, or offerings, not generic suggestions."
+    "• Keep each recommendation under 3 sentences."
+    "You will consider all client profiles and curate a recommendation for each one"
+    "Output format:"
+    "Client Name — [Short title of opportunity]"
+    "[Concise 2–3 sentence description with timing, location, and why it fits their interests.]"
+    "Example:"
+    "Noor Al-Fulan — “Van Cleef & Arpels Haute Joaillerie Private Preview, Paris (Oct 2025)”"
+    "An invitation-only showing of Van Cleef’s newest bridal haute jewellery line, with VIP fittings arranged through Maison representatives. Perfectly aligned with Noor’s engagement and brand collaborations."
+    "If no relevant opportunities are found for a client, state no opportunities as of now."
+)
 
-def _get_openai_client() -> OpenAI:
-    api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY") # type: ignore[attr-defined]
-    if not api_key:
-        st.stop()
-    return OpenAI(api_key=api_key)
+# ==================== Session State Init ====================
+if "theme" not in st.session_state:
+    st.session_state.theme = "Light"
 
-def _truncate(text: str, max_chars: int = MAX_REPLY_CHARS) -> str:
-    return text if len(text) <= max_chars else text[:max_chars]
+if "client_profiles" not in st.session_state:
+    st.session_state.client_profiles = []
+if "client_profile_hashes" not in st.session_state:   # prevent duplicates
+    st.session_state.client_profile_hashes = set()
+if "uploader_version" not in st.session_state:        # lets us clear uploader selection
+    st.session_state.uploader_version = 0
 
-def _build_messages(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [{"role": "system", "content": SYSTEM_PROMPT}] + history
-
-# -------------------- Sidebar --------------------
-
-# Initialize state
 if "chats" not in st.session_state:
     st.session_state.chats = {}
 if "active_chat" not in st.session_state:
@@ -100,18 +156,49 @@ if "active_chat" not in st.session_state:
     st.session_state.chats[new_id] = {"name": "Chat #1", "messages": []}
     st.session_state.active_chat = new_id
 
-with st.sidebar:
+# Ensure a persistent, non-deletable Opportunities tab exists
+if "opps_chat_id" not in st.session_state:
+    opps_id = str(uuid4())
+    st.session_state.opps_chat_id = opps_id
+    st.session_state.chats[opps_id] = {
+        "name": "Recommendations",
+        "messages": [],
+        "meta": {"pinned": True, "system": "opportunities"},
+    }
 
-    # UBS Logo from URL
+# ==================== Sidebar ====================
+with st.sidebar:
     st.markdown(
         """
         <div style="text-align: center; margin-top: -20px; margin-bottom: 20px;">
-            <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/3/34/UBS_Logo.png/960px-UBS_Logo.png" 
+            <img src="https://i.gyazo.com/737ba90e6e261129b45c099fa1b68c52.png"
                  style="width: 120px; display: block; margin: auto;" />
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+    # 🔎 Recommendations (navigate to pinned tab; does not create a new chat)
+    if st.button("🔎 Recommendations", key="opps_btn"):
+    # Remove the old Recommendations tab if it exists
+        if "opps_chat_id" in st.session_state:
+            old_id = st.session_state.opps_chat_id
+            if old_id in st.session_state.chats:
+                del st.session_state.chats[old_id]
+
+        # Create a new Recommendations chat
+        new_id = str(uuid4())
+        st.session_state.opps_chat_id = new_id
+        st.session_state.chats[new_id] = {
+            "name": "Recommendations",
+            "messages": [],
+            "meta": {"pinned": True, "system": "opportunities"},
+        }
+
+        # Set it active and trigger auto-generation
+        st.session_state.active_chat = new_id
+        st.session_state.autorun = True
+        st.rerun()
 
     # ➕ New Chat
     if st.button("➕ New Chat", key="new_chat_btn"):
@@ -121,101 +208,179 @@ with st.sidebar:
         st.session_state.active_chat = new_id
         st.rerun()
 
-    # Chat list
-    for chat_id, chat in st.session_state.chats.items():
-        is_active = chat_id == st.session_state.active_chat
+    # Chat list (pinned Opportunities first, non-deletable)
+    opps_id = st.session_state.get("opps_chat_id")
 
-        chat_cols = st.columns([0.8, 0.2])
-        if chat_cols[0].button(chat["name"], key=f"chat_btn_{chat_id}"):
+    # Render the rest (deletable)
+    to_delete: List[str] = []
+    for chat_id, chat in list(st.session_state.chats.items()):
+        if chat_id == opps_id:
+            continue
+        cols = st.columns([0.8, 0.2])
+        if cols[0].button(chat["name"], key=f"chat_btn_{chat_id}"):
             st.session_state.active_chat = chat_id
             st.rerun()
+        if cols[1].button("🗑", key=f"del_btn_{chat_id}"):
+            to_delete.append(chat_id)
 
-        if chat_cols[1].button("🗑", key=f"del_btn_{chat_id}"):
-            del st.session_state.chats[chat_id]
-            if chat_id == st.session_state.active_chat:
-                if st.session_state.chats:
-                    st.session_state.active_chat = next(iter(st.session_state.chats))
-                else:
-                    new_id = str(uuid4())
-                    st.session_state.chats[new_id] = {"name": "Chat #1", "messages": []}
-                    st.session_state.active_chat = new_id
-            st.rerun()
+    # Delete selected (never delete the pinned tab)
+    for chat_id in to_delete:
+        if chat_id == opps_id:
+            continue
+        del st.session_state.chats[chat_id]
+        if chat_id == st.session_state.active_chat:
+            # fallback to Opportunities or first remaining
+            next_ids = [cid for cid in st.session_state.chats.keys() if cid != opps_id]
+            if next_ids:
+                st.session_state.active_chat = next_ids[0]
+            else:
+                new_id = str(uuid4())
+                st.session_state.chats[new_id] = {"name": "Chat #1", "messages": []}
+                st.session_state.active_chat = new_id
+        st.rerun()
 
-    # Style everything
-    st.markdown(f"""
+    # Styling (avoid brittle testid selectors where possible)
+    st.markdown(
+        f"""
         <style>
-            /* Reset Streamlit button styles */
-            button[kind="secondary"], button[kind="primary"] {{
-                all: unset !important;
-                font-family: inherit !important;
-                cursor: pointer !important;
-                display: block;
-                width: 100%;
+            .new-chat-btn {{
+                color: red; font-size: 1rem; font-weight: bold; text-align: left;
+                display: block; width: 100%; margin-bottom: 1rem; padding: 8px 12px;
             }}
-
-            /* New Chat button */
-            button[data-testid="baseButton-new_chat_btn"] {{
-                color: red !important;
-                font-size: 1rem !important;
-                font-weight: bold !important;
-                text-align: left !important;
-                margin-bottom: 1rem !important;
-                padding: 8px 12px !important;
-            }}
-            button[data-testid="baseButton-new_chat_btn"]:hover {{
-                text-decoration: underline;
-            }}
-
-            /* Chat buttons */
-            button[data-testid^="baseButton-chat_btn_"] {{
-                color: black !important;
-                font-size: 0.95rem !important;
-                padding: 10px 14px !important;
-                border-radius: 10px !important;
-                text-align: left !important;
-                background-color: transparent !important;
-                transition: background-color 0.2s;
-            }}
-            button[data-testid^="baseButton-chat_btn_"]:hover {{
-                background-color: rgba(0, 0, 0, 0.05) !important;
-            }}
-
-            /* ACTIVE CHAT HIGHLIGHT */
-            button[data-testid="baseButton-chat_btn_{st.session_state.active_chat}"] {{
-            background-color: #d0d0d0 !important;
-            color: black !important;
-            font-weight: 600 !important;
-            border-radius: 10px !important;
-            border: 2px solid #888 !important;  /* <-- dark grey border */
-            }}
-
-            /* Delete icons */
-            button[data-testid^="baseButton-del_btn_"] {{
-                font-size: 1.2rem !important;
-                color: grey !important;
-                padding: 6px !important;
-                background: none !important;
-                border: none !important;
-            }}
-            button[data-testid^="baseButton-del_btn_"]:hover {{
-                color: red !important;
+            /* Minimal highlight for active chat via data-key attribute */
+            [data-chat-id="{st.session_state.active_chat}"] {{
+                background-color: #d0d0d0 !important; color: black !important;
+                font-weight: 600 !important; border-radius: 10px !important; border: 2px solid #888 !important;
             }}
         </style>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
-# -------------------- Main UI --------------------
+    st.markdown("---")
+    st.subheader("📎 Add Client Profile")
+
+    # Custom wrapper to visually simplify the uploader
+    st.markdown(
+        """
+        <style>
+            /* Hide the file name and clear (x) button */
+            .uploadedFile, .stUploadedFile {display: none !important;}
+            .stFileUploader label div[data-testid="stFileUploaderDropzone"] {
+                border: 2px dashed #bbb !important;
+                border-radius: 8px !important;
+                padding: 10px !important;
+                text-align: center !important;
+                color: #555 !important;
+            }
+            .stFileUploader label div[data-testid="stFileUploaderDropzone"]::before {
+                content: "📄 Drop or click to add client profile PDFs";
+                display: block;
+                font-weight: 500;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Always-visible uploader (multi-file)
+    uploaded_pdfs = st.file_uploader(
+        label="Upload client PDFs",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key=f"client_pdf_{st.session_state.uploader_version}",
+        label_visibility="collapsed",  # hide label to rely on CSS placeholder
+    )
+
+    system_prompt = BASE_SYSTEM_PROMPT
+
+    if uploaded_pdfs:
+        import hashlib, fitz
+        for f in uploaded_pdfs:
+            content = f.read()
+            h = hashlib.md5(content).hexdigest()
+            if h in st.session_state.client_profile_hashes:
+                continue
+            try:
+                doc = fitz.open(stream=content, filetype="pdf")
+                text = "".join(page.get_text("text") for page in doc).strip()
+                if not text:
+                    continue
+                sanitized = text.replace("\x00", "")
+                st.session_state.client_profiles.append(
+                    f"# New Client Profile Added\n---\n{sanitized}\n"
+                )
+                st.session_state.client_profile_hashes.add(h)
+            except Exception as e:
+                st.error(f"Failed to process {getattr(f, 'name', 'a file')}: {e}")
+        st.session_state.uploader_version += 1
+        st.rerun()
+
+        if added:
+            st.success(f"✅ Added {added} profile(s).")
+
+    # Controls: wipe all or just clear the current selection UI
+    if st.button("🧹 Wipe New Client Data", key="wipe_clients_btn", use_container_width=True):
+        st.session_state.client_profiles = []
+        st.session_state.client_profile_hashes = set()
+        st.session_state.uploader_version += 1
+        st.rerun()
+
+    st.caption(f"Profiles in session: {len(st.session_state.client_profiles)}")
+
+    if st.session_state.client_profiles:
+        MAX_PROFILE_CHARS = 6000
+        joined = "\n\n".join(st.session_state.client_profiles)
+        system_prompt = f"{BASE_SYSTEM_PROMPT}\n\n# Additional Client Profiles (session)\n{joined[:MAX_PROFILE_CHARS]}"
+    else:
+        system_prompt = BASE_SYSTEM_PROMPT
+
+MAX_PROFILE_CHARS = 12000  # raise if you like
+def _build_system_prompt() -> str:
+    base = BASE_SYSTEM_PROMPT
+    profs = st.session_state.get("client_profiles", [])
+    if profs:
+        joined = "\n\n".join(profs)
+        return f"{base}\n\n# Additional Client Profiles (session)\n{joined[:MAX_PROFILE_CHARS]}"
+    return base
+
+system_prompt = _build_system_prompt()
+
+# ==================== Main UI ====================
 active_chat_id = st.session_state.active_chat
 active_chat = st.session_state.chats[active_chat_id]
 
-st.title("UBS Wealth Manager Assistant 💬")
+st.title("Orion | Wealth Assistant 💬")
 st.caption(f"Chat Name: {active_chat['name']}")
 
-# Render previous messages
-for msg in active_chat["messages"]:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+# Render previous messages (hide seeded/hidden messages)
+for msg in active_chat.get("messages", []):
+    # Hide UI-only seeded messages
+    if msg.get("meta", {}).get("hidden"):
+        continue
+    with st.chat_message(msg.get("role", "assistant")):
+        st.markdown(msg.get("content", "")) 
 
-# Handle user input
+# Auto-run the Opportunities prompt only when switching to the pinned tab
+if st.session_state.get("autorun") and active_chat_id == st.session_state.get("opps_chat_id"):
+    st.session_state.autorun = False
+    client = _get_openai_client()
+    messages = _build_messages(system_prompt, [{"role": "user", "content": OPP_PROMPT}])
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=TEMPERATURE,
+        )
+        reply = _truncate(response.choices[0].message.content or "", MAX_REPLY_CHARS)
+    except Exception as e:  # noqa: BLE001
+        reply = f"Error: {e}"
+    with st.chat_message("assistant"):
+        st.markdown(reply)
+    # Persist only the assistant's reply so the tab looks like a regular chat of reports
+    active_chat["messages"].append({"role": "assistant", "content": reply})
+
+# Input
 user_input = st.chat_input("Type your message…")
 
 if user_input:
@@ -223,17 +388,20 @@ if user_input:
         st.markdown(user_input)
     active_chat["messages"].append({"role": "user", "content": user_input})
 
-    # Example response
     client = _get_openai_client()
+
+    # Compose request (optionally enrich with real-time context if desired)
+    messages = _build_messages(system_prompt, active_chat["messages"])  # system + history
+
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=_build_messages(active_chat["messages"]),
-            temperature=0.7,
+            model=MODEL,
+            messages=messages,
+            temperature=TEMPERATURE,
         )
         reply = response.choices[0].message.content or ""
-        reply = _truncate(reply, 2000)
-    except Exception as e:
+        reply = _truncate(reply, MAX_REPLY_CHARS)
+    except Exception as e:  # noqa: BLE001
         reply = f"Error: {e}"
 
     with st.chat_message("assistant"):
